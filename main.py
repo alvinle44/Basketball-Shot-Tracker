@@ -1,185 +1,224 @@
 import cv2
-import numpy as np
+import math
 import json
+import numpy as np
+import torch
 from ultralytics import YOLO
+from utils import get_device, smooth_point, detect_up, detect_down, score_prediction
 
-#load up models 
-ball_rim_model = YOLO("model/best_ball.pt")       # ball + rim
-arc_model = YOLO("model/best_arc3.pt")            # arc segmentation
-player_position_model = YOLO("yolov8n-pose.pt")   # player pose (ankles)
+#load the device 
+device = get_device()
+#load trained ball and rim tracking model 
+model = YOLO("model/best_ball.pt")
 
-#load up video to track 
-cap = cv2.VideoCapture("test_videos/al_dray_warriors.MP4")
+#load video to be processed 
+cap = cv2.VideoCapture("test_videos/al_dray_warriors.mp4")
 fps = cap.get(cv2.CAP_PROP_FPS)
-frame_w, frame_h = int(cap.get(3)), int(cap.get(4))
+w, h = int(cap.get(3)), int(cap.get(4))
 
-# Output video (optional)
-save_video = True
-out = None
-if save_video:
-    out = cv2.VideoWriter("output_dray_fast.mp4",
-                          cv2.VideoWriter_fourcc(*'mp4v'),
-                          fps,
-                          (frame_w, frame_h))
+#location to write labeled video to 
+out = cv2.VideoWriter("outputs/output_geo_merge.mp4",
+                      cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
 
-#Tracking variables
+#keep track of ball ids
+#missing frames keeps track of how long a ball disappears for and handles cases where ball is reassigned a new id
+#last_state keeps track of state of ball being attempted, made, missed
+balls, missing_frames, last_state = {}, {}, {}
 
+#velocity keeps track of the speed of the ball being shot
+#cooldowns prevents balls from being count as a double make or miss
+velocity, cooldowns = {}, {}
+rim_box, rim_center = None, None
 fgm, fga = 0, 0
-shot_in_progress = False
-ball_was_above_rim = False
-shot_result = None
-shot_type = "Unknown"
-shot_log = []
-
-frame_count = 0
-frame_skip = 3      # process every 3rd frame for speed
-display_video = False  # toggle display window
-
-print("Starting shot tracking...")
+frame_idx = 0
 
 
-#Main loop
+COOLDOWN_FRAMES = int(fps * 0.6)
+MAX_DISTANCE = 100
+MAX_MISSING_FRAMES = 15
+CONF_THRESHOLD = 0.35
+NET_DEPTH = 120
+
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    frame_count += 1
+    frame_idx += 1
 
-    #Skip frames for speed
-    if frame_count % frame_skip != 0:
+    results = model.predict(frame, verbose=False, device=device, conf=CONF_THRESHOLD)
+    detections = []
+
+
+    for r in results:
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            label = r.names[cls].lower()
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            center = ((x1 + x2)//2, (y1 + y2)//2)
+
+            if "rim" in label or "hoop" in label:
+                rim_box, rim_center = (x1, y1, x2, y2), center
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+            elif "ball" in label and conf > CONF_THRESHOLD:
+                detections.append(center)
+                cv2.circle(frame, center, 4, (0,0,255), -1)
+
+    if not rim_box:
+        out.write(frame)
         continue
 
-    current_time = frame_count / fps
-    ball_center, rim_center, rim_box = None, None, None
+    rx1, ry1, rx2, ry2 = rim_box
+    assigned = set()
 
-    #detect ball and rim logic
-    ball_rim_results = ball_rim_model.predict(frame, verbose=False)
-    for r in ball_rim_results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cls = int(box.cls[0])
-            conf = float(box.conf[0])
-            label = ball_rim_model.names[cls]
+    for center in detections:
+        cx, cy = center
+        matched_id, min_dist = None, float("inf")
 
-            #Draw detections (ball & rim)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        for bid, traj in balls.items():
+            px, py = traj[-1]
+            dist = math.hypot(px - cx, py - cy)
+            if dist < MAX_DISTANCE and dist < min_dist:
+                matched_id, min_dist = bid, dist
 
-            if label.lower() == "ball":
-                ball_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                cv2.circle(frame, ball_center, 5, (0, 0, 255), -1)
-            elif label.lower() == "rim":
-                rim_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                rim_box = (x1, y1, x2, y2)
+        if matched_id is None:
+            new_id = max(balls.keys(), default=-1) + 1
+            balls[new_id] = [center]
+            missing_frames[new_id] = 0
+            last_state[new_id] = "init"
+            velocity[new_id] = (0, 0)
+            assigned.add(new_id)
 
+            to_merge = None
+            for old_id, missed in list(missing_frames.items()):
+                if old_id == new_id:
+                    continue
+                if 0 < missed <= 8:  # short dropout
+                    old_traj = balls.get(old_id, [])
+                    if not old_traj:
+                        continue
+                    ox, oy = old_traj[-1]
+                    cx, cy = center
+                    dist = math.hypot(cx - ox, cy - oy)
 
-    #arc and player foot deteciton but not wokring well and taking extra time so leave out for now 
-    # arc_mask_combined = np.zeros(frame.shape[:2], dtype='uint8')
-    # arc_results = arc_model.predict(frame, verbose=False)
-    # for r in arc_results:
-    #     if r.masks is not None:
-    #         for mask in r.masks.data.cpu().numpy():
-    #             mask = (mask > 0.5).astype("uint8") * 255
-    #             mask_resized = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
-    #             arc_mask_combined = cv2.bitwise_or(arc_mask_combined, mask_resized)
+                    if rim_box:
+                        rim_center_y = (ry1 + ry2) / 2
+                        old_in_rim = (ry1 - 10) <= oy <= (ry2 + 40)
+                        new_below_rim = cy >= rim_center_y
+                        vertical_ok = old_in_rim and new_below_rim
+                        near_rim_zone = (rx1 - 150 < cx < rx2 + 150 and
+                                         ry1 - 180 < cy < ry2 + 180)
+                    else:
+                        near_rim_zone = False
+                        vertical_ok = False
 
+                    if dist < 130 and near_rim_zone and vertical_ok:
+                        print(f"🔁 Merging old ID {old_id} → new ID {new_id} (below rim handoff)")
+                        merged_traj = old_traj + [center]
+                        balls[new_id] = merged_traj[-50:]
+                        velocity[new_id] = velocity.get(old_id, (0, 0))
+                        last_state[new_id] = last_state.get(old_id, "init")
+                        cooldowns[new_id] = cooldowns.get(old_id, 0)
+                        missing_frames[new_id] = 0
+                        assigned.add(new_id)
 
-    #foot detection for arc
-    # foot_results = player_position_model.predict(frame, verbose=False)
-    # shot_type = "Unknown"
+                        cv2.line(frame, (int(ox), int(oy)), (int(cx), int(cy)), (0,255,255), 3)
+                        to_merge = old_id
+                        break
 
-    # if ball_center is not None:
-    #     closest_player = None
-    #     min_dist = float("inf")
+            if to_merge is not None:
+                for d in (balls, missing_frames, last_state, velocity, cooldowns):
+                    d.pop(to_merge, None)
 
-    #     for r in foot_results:
-    #         if r.keypoints is not None:
-    #             for person in r.keypoints.xy.cpu().numpy():
-    #                 left_ankle = tuple(map(int, person[15]))
-    #                 right_ankle = tuple(map(int, person[16]))
-    #                 hips = tuple(map(int, person[11]))
-    #                 center_est = hips if hips else ((left_ankle[0] + right_ankle[0]) // 2,
-    #                                                 (left_ankle[1] + right_ankle[1]) // 2)
-    #                 dist = np.linalg.norm(np.array(center_est) - np.array(ball_center))
-    #                 if dist < min_dist:
-    #                     min_dist = dist
-    #                     closest_player = (left_ankle, right_ankle)
-
-    #     def is_inside_arc(mask, point, region=10, threshold=0.2):
-    #         x, y = point
-    #         h, w = mask.shape
-    #         if not (0 <= x < w and 0 <= y < h):
-    #             return False
-    #         x1, y1 = max(0, x - region), max(0, y - region)
-    #         x2, y2 = min(w, x + region), min(h, y + region)
-    #         roi = mask[y1:y2, x1:x2]
-    #         return np.mean(roi > 0) > threshold
-
-    #     if closest_player:
-    #         left_ankle, right_ankle = closest_player
-    #         if np.sum(arc_mask_combined) == 0:
-    #             shot_type = "2PT"
-    #         else:
-    #             inside_left = is_inside_arc(arc_mask_combined, left_ankle)
-    #             inside_right = is_inside_arc(arc_mask_combined, right_ankle)
-    #             shot_type = "2PT" if (inside_left or inside_right) else "3PT"
+        else:
+            smoothed = smooth_point(balls[matched_id][-1], center)
+            balls[matched_id].append(smoothed)
+            if len(balls[matched_id]) > 50:
+                balls[matched_id].pop(0)
+            missing_frames[matched_id] = 0
+            assigned.add(matched_id)
 
 
-    #detect the ball and shot and calc 
-    if ball_center and rim_center:
-        #detect new shot
-        if not shot_in_progress and ball_center[1] < rim_center[1]:
-            shot_in_progress = True
-            ball_was_above_rim = True
+    for bid in list(balls.keys()):
+        traj = balls[bid]
 
-        #ball goes below rim again then shot ends
-        elif shot_in_progress and ball_center[1] > rim_center[1]:
-            fga += 1
-            if abs(ball_center[0] - rim_center[0]) < 50:
-                fgm += 1
-                shot_result = "MAKE"
-                color = (0, 255, 0)
-            else:
-                shot_result = "MISS"
-                color = (0, 0, 255)
+        if bid not in assigned:
+            missing_frames[bid] += 1
+            bx, by = traj[-1]
+            near_rim = (rx1 - 150 < bx < rx2 + 150 and
+                        ry1 - 150 < by < ry2 + 150)
 
-            shot_log.append({
-                "time": round(current_time, 2),
-                "result": shot_result,
-                "shot_type": shot_type
-            })
+            # Predict forward a few frames to help reconnect
+            if len(traj) >= 3 and missing_frames[bid] <= 5:
+                (x1, y1), (x2, y2) = traj[-2], traj[-1]
+                vx, vy = x2 - x1, y2 - y1
+                predicted = (x2 + vx, y2 + vy)
+                balls[bid].append(predicted)
 
-            shot_in_progress = False
-            ball_was_above_rim = False
+            if missing_frames[bid] > (25 if near_rim else 10):
+                for d in (balls, missing_frames, last_state, velocity, cooldowns):
+                    d.pop(bid, None)
+                continue
 
-            cv2.putText(frame, shot_result, (50, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, color, 3)
+        if len(traj) >= 2:
+            vx, vy = traj[-1][0] - traj[-2][0], traj[-1][1] - traj[-2][1]
+            velocity[bid] = (vx, vy)
 
-    #Overlay stats
+        # --- Geometric shot detection ---
+        if len(traj) < 5:
+            continue
 
-    cv2.putText(frame, f"FGM/FGA: {fgm}/{fga}", (50, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        bx, by = traj[-1]
+        vy = velocity[bid][1]
+        old_state = last_state.get(bid, "init")
 
-    
-    #Output
+        if detect_up(traj, rim_box) and vy > 0:
+            if bid not in cooldowns or frame_idx - cooldowns[bid] > COOLDOWN_FRAMES:
+                fga += 1
+                cooldowns[bid] = frame_idx
+                last_state[bid] = "attempting"
+                print(f"🎯 Shot attempt for Ball {bid} at frame {frame_idx}")
 
-    if save_video:
-        out.write(frame)
+        if last_state.get(bid) in ["attempting", "init"]:
+            if detect_down(traj, rim_box) and score_prediction(traj, rim_box):
+                if bid not in cooldowns or frame_idx - cooldowns[bid] > COOLDOWN_FRAMES:
+                    fgm += 1
+                    cooldowns[bid] = frame_idx
+                    last_state[bid] = "made"
+                    continue
+            elif detect_down(traj, rim_box) and not score_prediction(traj, rim_box):
+                if bid not in cooldowns or frame_idx - cooldowns[bid] > COOLDOWN_FRAMES:
+                    cooldowns[bid] = frame_idx
+                    last_state[bid] = "missed"
+                    continue
 
-    if display_video:
-        cv2.imshow("Shot Tracker", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if by > h - 40:
+            for d in (balls, missing_frames, last_state, velocity, cooldowns):
+                d.pop(bid, None)
+            continue
 
+        for k in range(1, len(traj)):
+            pt1 = (int(traj[k-1][0]), int(traj[k-1][1]))
+            pt2 = (int(traj[k][0]), int(traj[k][1]))
+            cv2.line(frame, pt1, pt2, (0,0,255), 2)
+
+        cx, cy = traj[-1]
+        cv2.putText(frame, f"ID {bid}", (int(cx)+10, int(cy)-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+
+    cv2.putText(frame, f"FGM/FGA: {fgm}/{fga}", (40, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    out.write(frame)
+    cv2.imshow("Shot Tracker (Geo + Merge)", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# ------------------- END -------------------
 cap.release()
-if out:
-    out.release()
+out.release()
 cv2.destroyAllWindows()
-
-#save log of shots made and attempts
+print(f"Done. Logged {fgm} / {fga}")
 with open("shot_log.json", "w") as f:
-    json.dump(shot_log, f, indent=4)
-print(f"Done. Logged {len(shot_log)}")
+    json.dump({"FGM": fgm, "FGA": fga}, f, indent=4)
