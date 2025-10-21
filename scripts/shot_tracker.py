@@ -4,7 +4,7 @@ import json
 import numpy as np
 import torch
 from ultralytics import YOLO
-from utils import get_device, smooth_point, detect_up, detect_down, score_prediction
+from scripts.utils import get_device, smooth_point, detect_up, detect_down, score_prediction
 from pathlib import Path
 
 def process_video(video_path=None, output_path=None, return_video=False):
@@ -93,12 +93,15 @@ def process_video(video_path=None, output_path=None, return_video=False):
 
                 if "rim" in label:
                     #create a rectangle around the rim to display that the rim is detected 
+                    
                     rim_box, rim_center = (x1, y1, x2, y2), center
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                    if return_video:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
                 elif "ball" in label and conf > CONF_THRESHOLD:
                     #mark center of ball with dot and add to detection array so the coords of the ball can be traced later
                     detections.append(center)
-                    cv2.circle(frame, center, 4, (0,0,255), -1)
+                    if return_video:
+                        cv2.circle(frame, center, 4, (0,0,255), -1)
 
         #if no rim was detectd, this frame can be skipped 
         #later on implement logic for two rims and whichever rim the ball is closest to assign to that rim for make/miss tracking for now it is ok 
@@ -296,17 +299,19 @@ def process_video(video_path=None, output_path=None, return_video=False):
                     d.pop(bid, None)
                 continue
             #draw trajectory of the ball, path that connects teh ball postions to see the ball path 
-            for k in range(1, len(traj)):
-                pt1 = (int(traj[k-1][0]), int(traj[k-1][1]))
-                pt2 = (int(traj[k][0]), int(traj[k][1]))
-                cv2.line(frame, pt1, pt2, (0,0,255), 2)
-            #label the ball id on the video 
-            cx, cy = traj[-1]
-            cv2.putText(frame, f"ID {bid}", (int(cx)+10, int(cy)-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+            if return_video:
+                for k in range(1, len(traj)):
+                    pt1 = (int(traj[k-1][0]), int(traj[k-1][1]))
+                    pt2 = (int(traj[k][0]), int(traj[k][1]))
+                    cv2.line(frame, pt1, pt2, (0,0,255), 2)
+                #label the ball id on the video 
+                cx, cy = traj[-1]
+                cv2.putText(frame, f"ID {bid}", (int(cx)+10, int(cy)-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
         #display the text on screen of field goal make/attempt count 
-        cv2.putText(frame, f"FGM/FGA: {fgm}/{fga}", (40, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        if return_video:
+            cv2.putText(frame, f"FGM/FGA: {fgm}/{fga}", (40, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
         if return_video:
             out.write(frame)
         # cv2.imshow("Shot Tracker (Geo + Merge)", frame)
@@ -314,9 +319,10 @@ def process_video(video_path=None, output_path=None, return_video=False):
         #     break
 
     cap.release()
-    if out:
+    if out is not None:
         out.release()
-    cv2.destroyAllWindows()
+    if return_video:
+        cv2.destroyAllWindows()
     print(f"Done. Logged {fgm} / {fga}")
     with open("shot_log.json", "w") as f:
         json.dump({"FGM": fgm, "FGA": fga}, f, indent=4)
