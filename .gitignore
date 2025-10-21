@@ -1,0 +1,28 @@
+# Python / env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Data & model artifacts
+datasets/
+data/
+outputs/
+runs/
+wandb/
+*.mp4
+*.mov
+*.avi
+*.zip
+*.onnx
+*.pth
+
+# Logs
+*.log
+*.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+Thumbs.db
